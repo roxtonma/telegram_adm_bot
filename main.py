@@ -57,15 +57,17 @@ def load_data_from_gist():
             # Load forward_map
             if 'forward_map.json' in gist_data['files']:
                 content = gist_data['files']['forward_map.json']['content']
-                data = json.loads(content)
-                forward_map = {int(k): tuple(v) for k, v in data.items()}
-                app.logger.info(f"Loaded {len(forward_map)} forward mappings from Gist")
+                if content.strip():  # Check if content is not empty
+                    data = json.loads(content)
+                    forward_map = {int(k): tuple(v) for k, v in data.items()}
+                    app.logger.info(f"Loaded {len(forward_map)} forward mappings from Gist")
             
             # Load replied_messages
             if 'replied_messages.json' in gist_data['files']:
                 content = gist_data['files']['replied_messages.json']['content']
-                replied_messages = set(json.loads(content))
-                app.logger.info(f"Loaded {len(replied_messages)} replied messages from Gist")
+                if content.strip():  # Check if content is not empty
+                    replied_messages = set(json.loads(content))
+                    app.logger.info(f"Loaded {len(replied_messages)} replied messages from Gist")
         else:
             app.logger.error(f"Failed to load from Gist: {response.status_code}")
             
@@ -282,54 +284,40 @@ def webhook() -> dict:
             if msg.get("reply_to_message", {}).get("message_id") in replied_messages:
                 reply_status = "✅ "
             
-            # Forward the message to admin
-            fwd = telegram_api(
-                "forwardMessage",
-                chat_id=ADMIN_ID,
-                from_chat_id=chat_id,
-                message_id=msg["message_id"],
-            )
-            
-            if "result" in fwd and "message_id" in fwd["result"]:
-                fwd_id = fwd["result"]["message_id"]
-                # Store the mapping: forwarded_message_id → (original_chat_id, original_message_id)
-                forward_map[fwd_id] = (chat_id, msg["message_id"])
-                save_data_to_gist()  # Save to Gist
-                
-                # Send user info to all admins
-                user_info = (
-                    f"{reply_status}From: {msg['from'].get('first_name', '')} "
-                    f"{msg['from'].get('last_name', '')}\n"
-                    f"Username: @{msg['from'].get('username', 'N/A')}\n"
-                    f"Chat ID: {chat_id}"
+            # Forward the message to all admins
+            for admin_id in ADMIN_IDS:
+                # Forward message to each admin
+                admin_fwd = telegram_api(
+                    "forwardMessage",
+                    chat_id=admin_id,
+                    from_chat_id=chat_id,
+                    message_id=msg["message_id"],
                 )
                 
-                for admin_id in ADMIN_IDS:
-                    # Forward message to each admin
-                    admin_fwd = telegram_api(
-                        "forwardMessage",
-                        chat_id=admin_id,
-                        from_chat_id=chat_id,
-                        message_id=msg["message_id"],
+                if "result" in admin_fwd and "message_id" in admin_fwd["result"]:
+                    admin_fwd_id = admin_fwd["result"]["message_id"]
+                    # Store mapping for each admin's forwarded message
+                    forward_map[admin_fwd_id] = (chat_id, msg["message_id"])
+                    
+                    # Send user info after forwarded message
+                    user_info = (
+                        f"{reply_status}From: {msg['from'].get('first_name', '')} "
+                        f"{msg['from'].get('last_name', '')}\n"
+                        f"Username: @{msg['from'].get('username', 'N/A')}\n"
+                        f"Chat ID: {chat_id}"
                     )
                     
-                    if "result" in admin_fwd and "message_id" in admin_fwd["result"]:
-                        admin_fwd_id = admin_fwd["result"]["message_id"]
-                        # Store mapping for each admin's forwarded message
-                        forward_map[admin_fwd_id] = (chat_id, msg["message_id"])
-                        
-                        # Send user info after forwarded message
-                        telegram_api(
-                            "sendMessage",
-                            chat_id=admin_id,
-                            text=user_info,
-                            reply_to_message_id=admin_fwd_id
-                        )
-                
-                # Update the mapping save after all forwards
-                save_data_to_gist()
-            else:
-                app.logger.error("Failed to get forwarded message ID: %s", fwd)
+                    telegram_api(
+                        "sendMessage",
+                        chat_id=admin_id,
+                        text=user_info,
+                        reply_to_message_id=admin_fwd_id
+                    )
+                else:
+                    app.logger.error("Failed to forward message to admin %s: %s", admin_id, admin_fwd)
+            
+            # Save the mapping after all forwards
+            save_data_to_gist()
             
             return {"ok": True}
 
