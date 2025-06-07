@@ -15,65 +15,102 @@ app = Flask(__name__)
 # === CONFIGURATION ===
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
-ADMIN_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
+
+
+# Support multiple admins
+ADMIN_IDS_STR = os.getenv("ADMIN_CHAT_IDS", os.getenv("ADMIN_CHAT_ID", "0"))
+ADMIN_IDS = [int(id.strip()) for id in ADMIN_IDS_STR.split(",") if id.strip()]
+
+
 WEBHOOK_URL = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
 
 
-# File storage paths
-FORWARD_MAP_FILE = "forward_map.json"
-REPLIED_MESSAGES_FILE = "replied_messages.json"
+# GitHub Gist configuration
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # Your GitHub personal access token
+GIST_ID = os.getenv("GIST_ID")  # Your Gist ID (created once)
 
 
-# Load data from files
+# Data storage
 forward_map = {}  # forwarded_msg_id → (orig_chat_id, orig_msg_id)
 replied_messages = set()  # Set of message IDs that have been replied to
 
 
-def load_data():
-    """Load forward_map and replied_messages from JSON files."""
+def load_data_from_gist():
+    """Load data from GitHub Gist."""
     global forward_map, replied_messages
     
-    # Load forward_map
-    if os.path.exists(FORWARD_MAP_FILE):
-        try:
-            with open(FORWARD_MAP_FILE, 'r') as f:
-                data = json.load(f)
-                # Convert string keys back to integers
-                forward_map = {int(k): tuple(v) for k, v in data.items()}
-            app.logger.info(f"Loaded {len(forward_map)} forward mappings")
-        except (json.JSONDecodeError, ValueError) as e:
-            app.logger.error(f"Error loading forward map: {e}")
-            forward_map = {}
+    if not GITHUB_TOKEN or not GIST_ID:
+        app.logger.warning("GitHub token or Gist ID not configured, using memory storage")
+        return
     
-    # Load replied_messages
-    if os.path.exists(REPLIED_MESSAGES_FILE):
-        try:
-            with open(REPLIED_MESSAGES_FILE, 'r') as f:
-                replied_messages = set(json.load(f))
-            app.logger.info(f"Loaded {len(replied_messages)} replied messages")
-        except json.JSONDecodeError as e:
-            app.logger.error(f"Error loading replied messages: {e}")
-            replied_messages = set()
-
-
-def save_forward_map():
-    """Save forward_map to JSON file."""
     try:
-        # Convert int keys to strings for JSON serialization
-        data = {str(k): list(v) for k, v in forward_map.items()}
-        with open(FORWARD_MAP_FILE, 'w') as f:
-            json.dump(data, f, indent=2)
+        headers = {
+            'Authorization': f'token {GITHUB_TOKEN}',
+            'Accept': 'application/vnd.github.v3+json'
+        }
+        
+        response = requests.get(f'https://api.github.com/gists/{GIST_ID}', headers=headers)
+        
+        if response.status_code == 200:
+            gist_data = response.json()
+            
+            # Load forward_map
+            if 'forward_map.json' in gist_data['files']:
+                content = gist_data['files']['forward_map.json']['content']
+                data = json.loads(content)
+                forward_map = {int(k): tuple(v) for k, v in data.items()}
+                app.logger.info(f"Loaded {len(forward_map)} forward mappings from Gist")
+            
+            # Load replied_messages
+            if 'replied_messages.json' in gist_data['files']:
+                content = gist_data['files']['replied_messages.json']['content']
+                replied_messages = set(json.loads(content))
+                app.logger.info(f"Loaded {len(replied_messages)} replied messages from Gist")
+        else:
+            app.logger.error(f"Failed to load from Gist: {response.status_code}")
+            
     except Exception as e:
-        app.logger.error(f"Error saving forward map: {e}")
+        app.logger.error(f"Error loading from Gist: {e}")
 
 
-def save_replied_messages():
-    """Save replied_messages to JSON file."""
+def save_data_to_gist():
+    """Save data to GitHub Gist."""
+    if not GITHUB_TOKEN or not GIST_ID:
+        return
+    
     try:
-        with open(REPLIED_MESSAGES_FILE, 'w') as f:
-            json.dump(list(replied_messages), f, indent=2)
+        headers = {
+            'Authorization': f'token {GITHUB_TOKEN}',
+            'Accept': 'application/vnd.github.v3+json'
+        }
+        
+        # Prepare data
+        forward_map_data = {str(k): list(v) for k, v in forward_map.items()}
+        replied_messages_data = list(replied_messages)
+        
+        # Update Gist
+        gist_data = {
+            'files': {
+                'forward_map.json': {
+                    'content': json.dumps(forward_map_data, indent=2)
+                },
+                'replied_messages.json': {
+                    'content': json.dumps(replied_messages_data, indent=2)
+                }
+            }
+        }
+        
+        response = requests.patch(f'https://api.github.com/gists/{GIST_ID}', 
+                                headers=headers, 
+                                json=gist_data)
+        
+        if response.status_code == 200:
+            app.logger.info("Data saved to Gist successfully")
+        else:
+            app.logger.error(f"Failed to save to Gist: {response.status_code}")
+            
     except Exception as e:
-        app.logger.error(f"Error saving replied messages: {e}")
+        app.logger.error(f"Error saving to Gist: {e}")
 
 
 def telegram_api(method: str, **params) -> dict:
@@ -166,9 +203,9 @@ def webhook() -> dict:
         chat_id = msg["chat"]["id"]
         user_id = msg.get("from", {}).get("id")
         
-        # Handle messages FROM the admin (your personal account)
-        if user_id == ADMIN_ID:
-            app.logger.info("Processing admin message")
+        # Handle messages FROM the admins
+        if user_id in ADMIN_IDS:
+            app.logger.info("Processing admin message from user %s", user_id)
             
             # Check if this is a reply to a forwarded message
             if "reply_to_message" in msg:
@@ -203,27 +240,29 @@ def webhook() -> dict:
                     # Mark as replied and notify admin
                     if response.get('ok'):
                         replied_messages.add(orig_msg_id)
-                        save_replied_messages()  # Save to file
-                        telegram_api(
-                            "sendMessage",
-                            chat_id=ADMIN_ID,
-                            text="✅ Reply sent successfully",
-                            reply_to_message_id=msg["message_id"]
-                        )
+                        save_data_to_gist()  # Save to Gist
+                        
+                        # Notify all admins about successful reply
+                        admin_name = msg['from'].get('first_name', 'Admin')
+                        for admin_id in ADMIN_IDS:
+                            telegram_api(
+                                "sendMessage",
+                                chat_id=admin_id,
+                                text=f"✅ Reply sent successfully by {admin_name}",
+                                reply_to_message_id=msg["message_id"] if admin_id == user_id else None
+                            )
                     else:
                         telegram_api(
                             "sendMessage",
-                            chat_id=ADMIN_ID,
+                            chat_id=user_id,
                             text="❌ Failed to send reply",
                             reply_to_message_id=msg["message_id"]
                         )
                 else:
                     # This is a reply to a message that wasn't forwarded from a user
-                    # Could be a reply to bot's own message or system message
                     app.logger.info("Reply to non-forwarded message, ignoring")
             else:
                 # This is a direct message from admin to bot (not a reply)
-                # You might want to handle this case differently
                 app.logger.info("Direct message from admin to bot")
             
             return {"ok": True}
@@ -255,21 +294,40 @@ def webhook() -> dict:
                 fwd_id = fwd["result"]["message_id"]
                 # Store the mapping: forwarded_message_id → (original_chat_id, original_message_id)
                 forward_map[fwd_id] = (chat_id, msg["message_id"])
-                save_forward_map()  # Save to file
+                save_data_to_gist()  # Save to Gist
                 
-                # Send user info after forwarded message
+                # Send user info to all admins
                 user_info = (
                     f"{reply_status}From: {msg['from'].get('first_name', '')} "
                     f"{msg['from'].get('last_name', '')}\n"
                     f"Username: @{msg['from'].get('username', 'N/A')}\n"
                     f"Chat ID: {chat_id}"
                 )
-                telegram_api(
-                    "sendMessage",
-                    chat_id=ADMIN_ID,
-                    text=user_info,
-                    reply_to_message_id=fwd_id
-                )
+                
+                for admin_id in ADMIN_IDS:
+                    # Forward message to each admin
+                    admin_fwd = telegram_api(
+                        "forwardMessage",
+                        chat_id=admin_id,
+                        from_chat_id=chat_id,
+                        message_id=msg["message_id"],
+                    )
+                    
+                    if "result" in admin_fwd and "message_id" in admin_fwd["result"]:
+                        admin_fwd_id = admin_fwd["result"]["message_id"]
+                        # Store mapping for each admin's forwarded message
+                        forward_map[admin_fwd_id] = (chat_id, msg["message_id"])
+                        
+                        # Send user info after forwarded message
+                        telegram_api(
+                            "sendMessage",
+                            chat_id=admin_id,
+                            text=user_info,
+                            reply_to_message_id=admin_fwd_id
+                        )
+                
+                # Update the mapping save after all forwards
+                save_data_to_gist()
             else:
                 app.logger.error("Failed to get forwarded message ID: %s", fwd)
             
@@ -279,11 +337,10 @@ def webhook() -> dict:
 
 
 if __name__ == "__main__":
-    load_data()  # Load existing data on startup
+    load_data_from_gist()  # Load existing data on startup
     set_webhook()
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 5000)),
         debug=True
     )
-    
